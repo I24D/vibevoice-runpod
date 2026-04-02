@@ -1,251 +1,221 @@
 """
-VibeVoice-Realtime RunPod Serverless Handler
+VibeVoice-Realtime RunPod Serverless Handler  (v2 — correct API)
 I24D — Real-Time TTS endpoint
 
-Input JSON:
-  {
-    "input": {
-      "text":         "Text to synthesize",
-      "speaker":      "Carter",          // optional, default: Carter
-      "format":       "wav",             // optional: wav | mp3 | ogg (default: wav)
-      "speed":        1.0,               // optional: 0.5-2.0 (default: 1.0)
-      "streaming":    false              // optional: true returns chunked base64
-    }
-  }
+Uses VibeVoice own classes (not generic AutoProcessor/AutoModel):
+  VibeVoiceStreamingForConditionalGenerationInference
+  VibeVoiceStreamingProcessor
 
-Output JSON (success):
-  {
-    "audio_b64":   "<base64 wav/mp3/ogg>",
-    "mime_type":   "audio/wav",
-    "duration_s":  3.45,
-    "speaker":     "Carter",
-    "characters":  120,
-    "latency_ms":  210
-  }
-
-Output JSON (error):
-  {
-    "error": "description"
-  }
+Voice embeddings are pre-cached .pt files in /vibevoice/demo/voices/streaming_model/
 """
 
 import base64
-import io
+import glob
 import os
-import sys
+import tempfile
 import time
 import traceback
 
-import numpy as np
 import runpod
-import soundfile as sf
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-
-MODEL_PATH = os.environ.get("VIBEVOICE_MODEL_PATH", "/models/vibevoice-realtime")
+# Config
+MODEL_PATH      = os.environ.get("VIBEVOICE_MODEL_PATH", "microsoft/VibeVoice-Realtime-0.5B")
 DEFAULT_SPEAKER = os.environ.get("VIBEVOICE_DEFAULT_SPEAKER", "Carter")
-SAMPLE_RATE = 24000  # VibeVoice-Realtime native sample rate
+SAMPLE_RATE     = 24000
+CFG_SCALE       = float(os.environ.get("VIBEVOICE_CFG_SCALE", "1.3"))
+VOICES_DIR      = os.environ.get("VIBEVOICE_VOICES_DIR", "/vibevoice/demo/voices/streaming_model")
 
-# Available speakers (base pack — download_experimental_voices.sh adds more)
-AVAILABLE_SPEAKERS = [
-    "Carter", "Aria", "Jenny", "Guy", "Nova",
-    "Echo", "Fable", "Onyx", "Shimmer", "Alloy",
-]
 
-# ─── Model loader (global — loaded once per container) ────────────────────────
+class VoiceMapper:
+    """Scans .pt files from voices/streaming_model and maps speaker names to paths."""
+    def __init__(self, voices_dir):
+        self.voice_presets = {}
+        if not os.path.exists(voices_dir):
+            print(f"[VibeVoice] WARNING: voices dir not found: {voices_dir}")
+            return
+        for pt_file in glob.glob(os.path.join(voices_dir, "**", "*.pt"), recursive=True):
+            name = os.path.splitext(os.path.basename(pt_file))[0]
+            self.voice_presets[name.lower()] = os.path.abspath(pt_file)
+            self.voice_presets[name]         = os.path.abspath(pt_file)
+        uniq = sorted({k for k in self.voice_presets if k == k.lower()})
+        print(f"[VibeVoice] Loaded {len(uniq)} voice embeddings: {uniq}")
 
-print(f"[VibeVoice] Loading model from {MODEL_PATH}...")
+    def get_voice_path(self, name):
+        return self.voice_presets.get(name) or self.voice_presets.get(name.lower())
+
+    def available_speakers(self):
+        return sorted({k for k in self.voice_presets if k == k.lower()})
+
+
+# --- Model loader (global, once per container) ---
+print(f"[VibeVoice] Initializing... MODEL={MODEL_PATH}")
 _t0 = time.time()
+_model_loaded = False
+_model = _processor = _voice_mapper = None
+_device = "cpu"
 
 try:
-    # VibeVoice uses transformers-compatible loading after March 2026 update
     import torch
-    from transformers import AutoProcessor, AutoModel
+    from vibevoice.modular.modeling_vibevoice_streaming_inference import (
+        VibeVoiceStreamingForConditionalGenerationInference,
+    )
+    from vibevoice.processor.vibevoice_streaming_processor import VibeVoiceStreamingProcessor
 
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[VibeVoice] Device: {_device}")
 
-    _processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
-    _model = AutoModel.from_pretrained(
+    _dtype = torch.bfloat16 if _device == "cuda" else torch.float32
+    _attn  = "flash_attention_2" if _device == "cuda" else "sdpa"
+
+    _processor = VibeVoiceStreamingProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    _model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.float16 if _device == "cuda" else torch.float32,
+        torch_dtype=_dtype,
+        attn_implementation=_attn,
         trust_remote_code=True,
-    ).to(_device)
+    )
+    if _device == "cuda":
+        _model = _model.cuda()
     _model.eval()
 
-    print(f"[VibeVoice] Model loaded in {time.time() - _t0:.1f}s on {_device}")
+    _voice_mapper = VoiceMapper(VOICES_DIR)
+    print(f"[VibeVoice] Ready in {time.time() - _t0:.1f}s | device={_device}")
     _model_loaded = True
 
 except Exception as e:
-    print(f"[VibeVoice] Model load error: {e}")
+    print(f"[VibeVoice] Model load FAILED: {e}")
     traceback.print_exc()
-    _model_loaded = False
-    _model = None
-    _processor = None
-    _device = "cpu"
 
 
-# ─── Audio helpers ────────────────────────────────────────────────────────────
+# --- Audio helpers ---
 
-def _numpy_to_wav_b64(audio_np: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
-    """Converts numpy float32 audio array to base64-encoded WAV."""
-    buf = io.BytesIO()
-    # Normalize to int16
-    audio_int16 = (audio_np * 32767).astype(np.int16)
-    sf.write(buf, audio_int16, sample_rate, format="WAV", subtype="PCM_16")
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("utf-8")
+def _speech_to_wav_bytes(speech_tensor):
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        wav_path = tmp.name
+    _processor.save_audio(speech_tensor, output_path=wav_path)
+    with open(wav_path, "rb") as f:
+        data = f.read()
+    os.unlink(wav_path)
+    return data
 
 
-def _numpy_to_mp3_b64(audio_np: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
-    """Converts numpy audio to base64 MP3 using ffmpeg via soundfile fallback."""
+def _convert_audio(wav_bytes, fmt):
+    import subprocess
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tw:
+        tw.write(wav_bytes)
+        wav_path = tw.name
+    out_path = wav_path.replace(".wav", f".{fmt}")
     try:
-        import subprocess, tempfile
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-            wav_path = tmp_wav.name
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
-            mp3_path = tmp_mp3.name
-
-        audio_int16 = (audio_np * 32767).astype(np.int16)
-        sf.write(wav_path, audio_int16, sample_rate, format="WAV")
-
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame", "-b:a", "128k", mp3_path],
-            capture_output=True, check=True,
-        )
-        with open(mp3_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
-    except Exception:
-        # Fallback to WAV
-        return _numpy_to_wav_b64(audio_np, sample_rate)
-
-
-def _numpy_to_ogg_b64(audio_np: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
-    """Converts numpy audio to base64 OGG/Opus — WhatsApp voice note format."""
-    try:
-        import subprocess, tempfile
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
-            wav_path = tmp_wav.name
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_ogg:
-            ogg_path = tmp_ogg.name
-
-        audio_int16 = (audio_np * 32767).astype(np.int16)
-        sf.write(wav_path, audio_int16, sample_rate, format="WAV")
-
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", wav_path,
-             "-codec:a", "libopus", "-b:a", "64k",
-             "-vbr", "on", "-compression_level", "10",
-             ogg_path],
-            capture_output=True, check=True,
-        )
-        with open(ogg_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
-    except Exception:
-        return _numpy_to_wav_b64(audio_np, sample_rate)
+        if fmt == "ogg":
+            cmd = ["ffmpeg", "-y", "-i", wav_path,
+                   "-codec:a", "libopus", "-b:a", "64k",
+                   "-vbr", "on", "-compression_level", "10", out_path]
+        else:
+            cmd = ["ffmpeg", "-y", "-i", wav_path,
+                   "-codec:a", "libmp3lame", "-b:a", "128k", out_path]
+        subprocess.run(cmd, capture_output=True, check=True)
+        with open(out_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except Exception as e:
+        print(f"[VibeVoice] {fmt} conversion failed: {e}")
+        return None
+    finally:
+        for p in [wav_path, out_path]:
+            try: os.unlink(p)
+            except: pass
 
 
-# ─── Inference ────────────────────────────────────────────────────────────────
+# --- Synthesis ---
 
-def _synthesize(text: str, speaker: str, speed: float = 1.0) -> np.ndarray:
-    """
-    Runs VibeVoice-Realtime inference.
-    Returns float32 numpy array at SAMPLE_RATE.
-    """
+def _synthesize(text, speaker, cfg_scale):
     import torch
+    voice_path = _voice_mapper.get_voice_path(speaker) if _voice_mapper else None
+    if voice_path is None and _voice_mapper:
+        voice_path = _voice_mapper.get_voice_path(DEFAULT_SPEAKER)
+    if voice_path is None:
+        raise RuntimeError(f"Voice embedding not found for: {speaker}")
 
-    inputs = _processor(
+    target_device = next(_model.parameters()).device
+    cached_prompt = torch.load(voice_path, map_location=target_device, weights_only=False)
+
+    inputs = _processor.process_input_with_cached_prompt(
         text=text,
-        speaker=speaker,
-        speed=speed,
+        cached_prompt=cached_prompt,
+        padding=True,
         return_tensors="pt",
-    ).to(_device)
+        return_attention_mask=True,
+    )
+    for k, v in inputs.items():
+        if torch.is_tensor(v):
+            inputs[k] = v.to(target_device)
 
     with torch.no_grad():
-        output = _model.generate(**inputs)
-
-    # Extract audio from model output
-    if hasattr(output, "audio"):
-        audio = output.audio.squeeze().cpu().float().numpy()
-    elif isinstance(output, torch.Tensor):
-        audio = output.squeeze().cpu().float().numpy()
-    else:
-        # Fallback: try first element
-        audio = output[0].squeeze().cpu().float().numpy()
-
-    # Normalize
-    max_val = np.abs(audio).max()
-    if max_val > 0:
-        audio = audio / max_val * 0.95
-
-    return audio
+        outputs = _model.generate(
+            **inputs,
+            cfg_scale=cfg_scale,
+            tokenizer=_processor.tokenizer,
+            generation_config={"do_sample": False},
+        )
+    return outputs
 
 
-# ─── RunPod Handler ───────────────────────────────────────────────────────────
+# --- RunPod Handler ---
 
-def handler(job: dict) -> dict:
-    """
-    RunPod serverless job handler.
-    Receives job dict, returns synthesis result.
-    """
+def handler(job):
     job_input = job.get("input", {})
-
-    # ── Input validation ──
     text = str(job_input.get("text", "")).strip()
     if not text:
         return {"error": "Missing required field: text"}
     if len(text) > 4000:
         return {"error": f"Text too long ({len(text)} chars). Max: 4000."}
 
-    speaker = job_input.get("speaker", DEFAULT_SPEAKER)
-    if speaker not in AVAILABLE_SPEAKERS:
-        speaker = DEFAULT_SPEAKER
+    speaker    = job_input.get("speaker", DEFAULT_SPEAKER)
+    output_fmt = job_input.get("format", "wav").lower()
+    if output_fmt not in ("wav", "mp3", "ogg"):
+        output_fmt = "wav"
+    cfg = float(job_input.get("cfg_scale", CFG_SCALE))
 
-    output_format = job_input.get("format", "wav").lower()
-    if output_format not in ("wav", "mp3", "ogg"):
-        output_format = "wav"
-
-    speed = float(job_input.get("speed", 1.0))
-    speed = max(0.5, min(2.0, speed))
-
-    # ── Model availability check ──
     if not _model_loaded:
         return {"error": "Model not loaded. Check container logs."}
 
-    # ── Synthesis ──
     t_start = time.time()
     try:
-        audio_np = _synthesize(text, speaker, speed)
+        outputs = _synthesize(text, speaker, cfg)
     except Exception as e:
         traceback.print_exc()
         return {"error": f"Synthesis failed: {str(e)[:300]}"}
 
+    if not outputs.speech_outputs or outputs.speech_outputs[0] is None:
+        return {"error": "Model returned no audio output."}
+
+    speech = outputs.speech_outputs[0]
+    audio_samples = speech.shape[-1] if len(speech.shape) > 0 else len(speech)
+    duration_s = round(audio_samples / SAMPLE_RATE, 3)
     latency_ms = round((time.time() - t_start) * 1000)
-    duration_s = round(len(audio_np) / SAMPLE_RATE, 3)
 
-    # ── Encode output ──
-    mime_map = {"wav": "audio/wav", "mp3": "audio/mpeg", "ogg": "audio/ogg; codecs=opus"}
-    if output_format == "mp3":
-        audio_b64 = _numpy_to_mp3_b64(audio_np)
-    elif output_format == "ogg":
-        audio_b64 = _numpy_to_ogg_b64(audio_np)
+    wav_bytes = _speech_to_wav_bytes(speech)
+    mime_map  = {"wav": "audio/wav", "mp3": "audio/mpeg", "ogg": "audio/ogg; codecs=opus"}
+
+    if output_fmt in ("ogg", "mp3"):
+        audio_b64 = _convert_audio(wav_bytes, output_fmt)
+        if audio_b64 is None:
+            output_fmt = "wav"
+            audio_b64  = base64.b64encode(wav_bytes).decode()
     else:
-        audio_b64 = _numpy_to_wav_b64(audio_np)
+        audio_b64 = base64.b64encode(wav_bytes).decode()
 
-    print(f"[VibeVoice] speaker={speaker} chars={len(text)} duration={duration_s}s latency={latency_ms}ms")
+    print(f"[VibeVoice] OK speaker={speaker} chars={len(text)} dur={duration_s}s latency={latency_ms}ms fmt={output_fmt}")
 
     return {
         "audio_b64":  audio_b64,
-        "mime_type":  mime_map[output_format],
+        "mime_type":  mime_map[output_fmt],
         "duration_s": duration_s,
         "speaker":    speaker,
         "characters": len(text),
         "latency_ms": latency_ms,
-        "format":     output_format,
+        "format":     output_fmt,
     }
 
-
-# ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("[VibeVoice] Starting RunPod serverless worker...")
