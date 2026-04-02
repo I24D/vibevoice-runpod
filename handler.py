@@ -1,24 +1,21 @@
 """
-VibeVoice-Realtime RunPod Serverless Handler  (v2 — correct API)
-I24D — Real-Time TTS endpoint
-
-Uses VibeVoice own classes (not generic AutoProcessor/AutoModel):
-  VibeVoiceStreamingForConditionalGenerationInference
-  VibeVoiceStreamingProcessor
-
-Voice embeddings are pre-cached .pt files in /vibevoice/demo/voices/streaming_model/
+VibeVoice-Realtime RunPod Serverless Handler  (v3)
+Fixes:
+  - Always use sdpa attention (flash_attention_2 not installed by default)
+  - VoiceMapper parses en-Carter_man.pt -> speaker "Carter"
+  - Robust fallback chain
 """
 
 import base64
 import glob
 import os
+import re
 import tempfile
 import time
 import traceback
 
 import runpod
 
-# Config
 MODEL_PATH      = os.environ.get("VIBEVOICE_MODEL_PATH", "microsoft/VibeVoice-Realtime-0.5B")
 DEFAULT_SPEAKER = os.environ.get("VIBEVOICE_DEFAULT_SPEAKER", "Carter")
 SAMPLE_RATE     = 24000
@@ -27,27 +24,40 @@ VOICES_DIR      = os.environ.get("VIBEVOICE_VOICES_DIR", "/vibevoice/demo/voices
 
 
 class VoiceMapper:
-    """Scans .pt files from voices/streaming_model and maps speaker names to paths."""
+    """
+    Maps speaker names to .pt file paths.
+    Handles filenames like: en-Carter_man.pt  ->  Carter
+    """
     def __init__(self, voices_dir):
-        self.voice_presets = {}
+        self.voice_presets = {}   # lowercase_name -> path
+        self.raw_presets   = {}   # exact filename stem -> path
         if not os.path.exists(voices_dir):
             print(f"[VibeVoice] WARNING: voices dir not found: {voices_dir}")
             return
         for pt_file in glob.glob(os.path.join(voices_dir, "**", "*.pt"), recursive=True):
-            name = os.path.splitext(os.path.basename(pt_file))[0]
-            self.voice_presets[name.lower()] = os.path.abspath(pt_file)
-            self.voice_presets[name]         = os.path.abspath(pt_file)
-        uniq = sorted({k for k in self.voice_presets if k == k.lower()})
-        print(f"[VibeVoice] Loaded {len(uniq)} voice embeddings: {uniq}")
+            stem = os.path.splitext(os.path.basename(pt_file))[0]  # e.g. "en-Carter_man"
+            path = os.path.abspath(pt_file)
+            self.raw_presets[stem.lower()] = path
+            # Extract speaker name: en-Carter_man -> Carter
+            m = re.match(r'^[a-z]{2}-([A-Za-z]+)_', stem)
+            if m:
+                speaker = m.group(1)
+                self.voice_presets[speaker.lower()] = path
+            else:
+                # Plain name like "Carter.pt"
+                self.voice_presets[stem.lower()] = path
+        speakers = sorted(self.voice_presets.keys())
+        print(f"[VibeVoice] Mapped {len(speakers)} speakers: {speakers}")
 
     def get_voice_path(self, name):
-        return self.voice_presets.get(name) or self.voice_presets.get(name.lower())
+        return (self.voice_presets.get(name.lower())
+                or self.raw_presets.get(name.lower()))
 
     def available_speakers(self):
-        return sorted({k for k in self.voice_presets if k == k.lower()})
+        return sorted(self.voice_presets.keys())
 
 
-# --- Model loader (global, once per container) ---
+# --- Model loader ---
 print(f"[VibeVoice] Initializing... MODEL={MODEL_PATH}")
 _t0 = time.time()
 _model_loaded = False
@@ -64,10 +74,14 @@ try:
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[VibeVoice] Device: {_device}")
 
+    # Use sdpa always - flash_attention_2 requires separate install
     _dtype = torch.bfloat16 if _device == "cuda" else torch.float32
-    _attn  = "flash_attention_2" if _device == "cuda" else "sdpa"
+    _attn  = "sdpa"
 
+    print(f"[VibeVoice] Loading processor from {MODEL_PATH}...")
     _processor = VibeVoiceStreamingProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
+
+    print(f"[VibeVoice] Loading model from {MODEL_PATH}...")
     _model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
         MODEL_PATH,
         torch_dtype=_dtype,
@@ -79,11 +93,12 @@ try:
     _model.eval()
 
     _voice_mapper = VoiceMapper(VOICES_DIR)
+
     print(f"[VibeVoice] Ready in {time.time() - _t0:.1f}s | device={_device}")
     _model_loaded = True
 
 except Exception as e:
-    print(f"[VibeVoice] Model load FAILED: {e}")
+    print(f"[VibeVoice] FATAL: Model load failed: {e}")
     traceback.print_exc()
 
 
@@ -121,19 +136,25 @@ def _convert_audio(wav_bytes, fmt):
         return None
     finally:
         for p in [wav_path, out_path]:
-            try: os.unlink(p)
-            except: pass
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 # --- Synthesis ---
 
 def _synthesize(text, speaker, cfg_scale):
     import torch
+
     voice_path = _voice_mapper.get_voice_path(speaker) if _voice_mapper else None
     if voice_path is None and _voice_mapper:
         voice_path = _voice_mapper.get_voice_path(DEFAULT_SPEAKER)
+        if voice_path is None and _voice_mapper.available_speakers():
+            first = _voice_mapper.available_speakers()[0]
+            voice_path = _voice_mapper.get_voice_path(first)
     if voice_path is None:
-        raise RuntimeError(f"Voice embedding not found for: {speaker}")
+        raise RuntimeError(f"No voice embedding found (voices_dir={VOICES_DIR})")
 
     target_device = next(_model.parameters()).device
     cached_prompt = torch.load(voice_path, map_location=target_device, weights_only=False)
@@ -204,7 +225,7 @@ def handler(job):
     else:
         audio_b64 = base64.b64encode(wav_bytes).decode()
 
-    print(f"[VibeVoice] OK speaker={speaker} chars={len(text)} dur={duration_s}s latency={latency_ms}ms fmt={output_fmt}")
+    print(f"[VibeVoice] OK speaker={speaker} chars={len(text)} dur={duration_s}s lat={latency_ms}ms fmt={output_fmt}")
 
     return {
         "audio_b64":  audio_b64,
